@@ -2,7 +2,6 @@
 #include <Adafruit_GFX.h>                          // screen graphics library
 #include <Adafruit_SSD1306.h>                      // screen library
 #include <math.h>
-#include "esp_system.h"                           // for esp_random()
 
 // UART handling pins
 #define RX2_PIN          16                       // uses rx2 because rx1 has to be low during boot
@@ -43,14 +42,15 @@ const size_t HexMax = 8;  // enforces 8-nibble length. used in SendData and Read
 
 // UNCOMMENT ALL 3 FOR ORIGINAL FUNCTIONALITY 
  uint32_t Kpub  = 0x00010001;               // public key, E --> (N,E)                  PUBLIC,  same in both
- uint32_t Kpri  = 0x57EDF941;               // E*D = 1 mod phi(N). aka 'D' ---> (N,D) PRIVATE, unique to each device
- uint32_t N     = 0xFFE000FF;               // modulus value, N = 0xFFE000FF.       PUBLIC,  unique to each device
+ //uint32_t Kpri  = 0x57EDF941;               // E*D = 1 mod phi(N). aka 'D' ---> (N,D) PRIVATE, unique to each device
+ //uint32_t N     = 0xFFE000FF;               // modulus value, N = 0xFFE000FF.       PUBLIC,  unique to each device
  uint32_t p      = 0;                       // creates p in (p,q) necessary for key creation
  uint32_t q      = 0;                       // creates the q ^^^
-
+ uint32_t N      = 0;
+ uint32_t Kpri   = 0; 
+ uint32_t phi    = 0;
  bool createKey = true;
 
-//uint32_t Kpri = D_Maker(N, Kpub, true);  // get private D (randomized)
 
 void setup() {
   Serial.begin(115200);                                           // serial comm for computer use. Not needed for normal function
@@ -84,7 +84,7 @@ void setup() {
 }
 
 void loop() {
-  if(createKey) KeyMaker();  // only runs once, creates the keys needed for random encryption.
+  while(createKey){createKey = KeyMaker(); }
   ReceiveData();          // check RX buffer
   ReadKey();              // read keypad
 
@@ -96,7 +96,9 @@ void loop() {
   // screeny shows incoming data. 
   ScreenTime(screeny, 1,  0, String("Kpri : ") + Kpri       , 0,0, true , true, false);  // private key shown in yellow
   ScreenTime(screeny, 1, 20, String("En.Rx: ") + RxCipher   , 0,0, false, true, false);  // display encrypted data received
-  ScreenTime(screeny, 1, 30, String("De.Rx: ") + RxPlainText, 0,0, false, true, true );  // display decrypted message received
+  ScreenTime(screeny, 1, 30, String("De.Rx: ") + RxPlainText, 0,0, false, true, false);  // display decrypted message received
+  ScreenTime(screeny, 1, 40, String("N    : ") + N          , 0,0, false, true, false);  // show modulus
+  ScreenTime(screeny, 1, 50, String("Phi  : ") + phi        , 0,0, false, true, true );  // show phi
 
   // display shows outgoing data
   ScreenTime(display, 1,  0, String("Kpub : ") + Kpub       , 0,0, true , true, false);  // public key in yellow
@@ -282,51 +284,86 @@ char Hex2Char(uint8_t nib) {               // Lut
   }
 }
 
-uint32_t KeyMaker(uint32_t N, uint32_t E, bool randomize) {
- TrueRandom = analogRead(18);      // get floating analog value of unused pin
- randomSeed(TrueRandom);           // use the float value to seed random numbers
-for(int i = 0; i < TrueRandom; i++){
-  random(0,4096)
+
+// everything below here is used in initial key making
+
+uint32_t gcd32(uint32_t first, uint32_t second){    // finds the greatest common denominator using Euclid algorithm
+  uint32_t remainder = 0;                           // set remainder = 0 to start
+  while(second){                                    // degrades the second varibale
+    remainder = first%second;                       // find remainder of first / second
+    first = second;                                 // think of this as long division
+    second = remainder;                             // degradation of second
+  }
+  return first;                                     // first will hold the gcd at the end
 }
 
-  createKey = false;                                      // prevents this function from running more than once
-  if (N < 3 || (E%2 != 0)) return 0;                      // reject smal N values or odd E values
-  uint32_t p = 0;
-  uint32_t q = 0;
-  if ((N%2) == 0) { p = 2; q = N >> 1; }                  // if N is even, p=2, q=N/2
-  else {                                                  // if N is odd, 
-    for (uint32_t d = 3; d * d <= N; d += 2) {            // init d=3, square d until d^2 > N, each iteration d+2
-      if ((N % d) == 0) {                                 // if mod = 0, N is divisible by d
-         p = d;                                           // therefore, one factor of N is d, set p=d
-         q = N / d;                                       // find other factor by dividing
-         break; }                                         // problem solved, exit loop
+uint32_t modinv32(uint32_t number, uint32_t modulus){       // extended euclidean algorithm
+ int64_t old_coeff = 0;                                     // older coeff for modulus term
+ int64_t new_coeff = 1;                                     // new coeff intialized to 1
+ int64_t old_rem = (int64_t)modulus;                        // start with old remainder = modulus
+ int64_t new_rem = (int64_t)(number % modulus);             // set new remainder to mod value, keeps in field, prevent overflow
+  while (new_rem != 0) {                                    // loop until remainder=0
+    int64_t quotient = old_rem / new_rem;                   // compute integer quotient
+    int64_t temp_coeff = old_coeff - quotient * new_coeff;  // Bezout update
+    old_coeff = new_coeff;                                  // reset coeff
+    new_coeff = temp_coeff;                                 // reset coeff
+    int64_t temp_rem = old_rem - quotient * new_rem;        // compute next remainder
+    old_rem = new_rem;                                      // shift remainders
+    new_rem = temp_rem;                                     // ^^
+  }
+  if (old_rem != 1) return 0;                               // if gcd 
+  if (old_coeff < 0) old_coeff += modulus;                  // if negative, use mod field to make positive (cyclic)
+  return (uint32_t)old_coeff;                               // return inverse 
+}
+
+bool KeyMaker() {   // find and declare p,q,N,E,D,phi
+
+// Randomization sequence, prevents identical or predictable results
+ int TrueRandom = analogRead(34);         // get floating analog value of unused pin
+ randomSeed(TrueRandom);                  // use the random value as a seed
+ int TruerRandom = analogRead(35);        // get another floating analog value of unused pin
+ TrueRandom = TrueRandom ^ TruerRandom;   // xor the two random values to stir the pot
+ randomSeed(TrueRandom);                  // use random value to seed random numbers
+
+  // LUT of highest value 16-bit prime numbers
+  static const uint32_t Primes[100] = {    // list of 100 primes that can possibly be either p or q
+  65521, 65519, 65513, 65497, 65479, 65437, 65423, 65419, 65413, 65393,
+  65371, 65357, 65353, 65347, 65327, 65323, 65287, 65279, 65267, 65263,
+  65257, 65239, 65233, 65231, 65213, 65203, 65183, 65179, 65173, 65171,
+  65167, 65159, 65147, 65143, 65141, 65123, 65119, 65099, 65089, 65063,
+  65053, 65041, 65033, 65029, 65027, 65011, 65003, 64997, 64969, 64937,
+  64927, 64921, 64919, 64901, 64891, 64877, 64871, 64849, 64841, 64831,
+  64811, 64801, 64783, 64781, 64763, 64747, 64717, 64711, 64709, 64703,
+  64693, 64679, 64661, 64657, 64651, 64627, 64621, 64613, 64609, 64591,
+  64579, 64567, 64553, 64547, 64543, 64513, 64507, 64501, 64499, 64493,
+  64489, 64483, 64463, 64451, 64439, 64433, 64403, 64399, 64381, 64373
+  };
+
+  // choose random numbers to to seed from, ensure they are not the same one.
+  uint8_t i = random() % 100;     // random number between 0-99
+  uint8_t j = random() % 100;     // random number from 0-99
+  while( j==i ) j = random() % 100; // make sure j != i
+
+  // set possible values of p and q to start
+  uint32_t maybe_p = Primes[i];   // set possible values from LUT 
+  uint32_t maybe_q = Primes[j];
+
+  // 
+  while (gcd32(Kpub, maybe_p - 1) != 1) {      // checks that p and q are coprimes
+    i = random(100);                        // reset i to be a different value if fails coprime
+    maybe_p = Primes[i];                    // get the ith prime value
     }
-    if (p == 0) return 0;            // failed to factor
+  while ( maybe_q == maybe_p || gcd32(Kpub, maybe_q - 1) != 1) {   // same as before, but also i and j cant be the same
+    j = random(100);                                             // randomize randomly
+    maybe_q = Primes[j];                                         // set new possible q value
   }
-  uint32_t phi = (p-1) * (q-1);
-
-  // extended Euclid: D0 = E^{-1} mod phi
-  int64_t prevCoeff = 0;            // previous coefficient
-  int64_t currCoeff = 1;            // current coefficient
-  int64_t prevRem = phi;            // previous remainder
-  int64_t currRem = E % phi;        // current remainder
-
-  while (currRem != 0) {                              // loop until remainder = 0
-    int64_t quotient = prevRem / currRem;             // finds current quotient
-    int64_t tmp = prevCoeff - quotient * currCoeff;   // long division
-    prevCoeff = currCoeff;                            // log previous coefficinet
-    currCoeff = tmp;                                  // update current coeff 
-    tmp = prevRem - quotient * currRem;               // extract current remainder
-    prevRem = currRem;                                // update previous remainder
-    currRem = tmp;                                    // update current remainder
-  }
-  if (prevRem != 1) return 0;                         // if gcd(E,phi) != 1, no mod inverse exists
-  uint32_t D = (prevCoeff < 0) ? (prevCoeff + phi) : prevCoeff;
-
-   if (randomize && phi) {                  // only if flag is true and φ > 0
-    uint32_t k = (esp_random() & 7);      // pick small random 0–7 (3 bits)
-    D = D + k * phi;                     // D' = D + k * phi
-  }
-
-  return D;                          // 0 ⇒ failure; else use (N,D) as private key
+  p = maybe_p;                // set new values
+  q = maybe_q;                // another one
+  N = (uint32_t)((uint64_t)p * (uint64_t)q);
+  phi = (p-1) * (q-1);       // set phi
+  Kpri = modinv32(Kpub,phi);    // get D
+  if(Kpri == 0){return true;}  // if returns true, this function will run again
+return false;                 // createKey=false will prevent this function running again. permanently sets keys
 }
+
+
