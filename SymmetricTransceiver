@@ -1,0 +1,332 @@
+#include <Wire.h>                                  // i2c comm library
+#include <Adafruit_GFX.h>                          // screen graphics library
+#include <Adafruit_SSD1306.h>                      // screen library
+#include <math.h>
+#include "esp_system.h"                           // for esp_random()
+
+// UART handling pins
+#define RX2_PIN          16                       // uses rx2 because rx1 has to be low during boot
+#define TX2_PIN          17                       // use Tx2 because it is related to rx2
+#define UART_BAUDRATE    115200                   // MUST match baud in other code
+
+// Instantiate Screens
+Adafruit_SSD1306 display(128, 64, &Wire, -1 );   // 128 wide, 64 high, I2C, no reset pin
+Adafruit_SSD1306 screeny(128, 64, &Wire, -1 );
+
+bool SendIt = false;            // true when enter key pressed
+
+constexpr int NUM_ROWS = 4;    // keypad is 4x4
+constexpr int NUM_COLS = 4;
+
+const int COLS[NUM_COLS] = { 26, 25, 33, 32 };   // column GPIOs (outputs)          https://cdn.sparkfun.com/assets/f/f/a/5/0/DS-16038.pdf
+const int ROWS[NUM_ROWS] = { 13, 14, 27, 23 };   // row GPIOs (inputs w/ pullups)
+
+const char KEYS[NUM_ROWS][NUM_COLS] = {  // Key layout (row, col)
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+String UserBuff;      // ReadKey() writes to this. 
+
+String TxCipher;      // encrypted version of user input. for display only
+String TxPlainText;   // decrypted version of user input. should match UserBuff at all times
+
+String RxCipher;      // encrypted version of received data. This is how all data should be received
+String RxPlainText;   // decrypted version of received data. should match user input on other device
+
+const size_t HexMax = 8;  // enforces 8-nibble length. used in SendData and ReadKey
+
+// RSA variables
+// public variables are predefined, private will be calculated from scratch
+
+// UNCOMMENT ALL 3 FOR ORIGINAL FUNCTIONALITY 
+ uint32_t Kpub  = 0x00010001;               // public key, E --> (N,E)                  PUBLIC,  same in both
+ uint32_t Kpri  = 0x57EDF941;               // E*D = 1 mod phi(N). aka 'D' ---> (N,D) PRIVATE, unique to each device
+ uint32_t N     = 0xFFE000FF;               // modulus value, N = 0xFFE000FF.       PUBLIC,  unique to each device
+ uint32_t p      = 0;                       // creates p in (p,q) necessary for key creation
+ uint32_t q      = 0;                       // creates the q ^^^
+
+ bool createKey = true;
+
+//uint32_t Kpri = D_Maker(N, Kpub, true);  // get private D (randomized)
+
+void setup() {
+  Serial.begin(115200);                                           // serial comm for computer use. Not needed for normal function
+  while (!Serial) {delay(10);}                                    // wait for serial to be established
+  Serial2.begin(UART_BAUDRATE, SERIAL_8N1, RX2_PIN, TX2_PIN);     // predefined baud, 8bit1stop no parity, predefined rx&tx pins
+  Serial2.setTimeout(500);                                        // exit if serial comm takes more than 500ms
+  Wire.begin(21, 22);                                             // define 21 and 22 as I2C pins
+  display.begin( SSD1306_SWITCHCAPVCC, 0x3C );                    // OLED initialization
+  screeny.begin( SSD1306_SWITCHCAPVCC, 0x3D );                    // Different address for screeny
+
+  for (int c = 0; c < 4; ++c) {                                   // iterate through columns
+  pinMode(COLS[c], OUTPUT);                                       // set all columns to output
+  digitalWrite(COLS[c], HIGH);                                    // idle columns HIGH
+  }
+  for (int r = 0; r < 4; ++r) { pinMode(ROWS[r], INPUT_PULLUP);}  // set row pins as inputs. They need pullups
+
+  display.clearDisplay();                                       // remove previous screen data
+  display.setTextColor(SSD1306_WHITE);                          // max brightness
+  display.display();                                            // update display
+
+  screeny.clearDisplay();                                       // remove previous sceen data
+  screeny.setTextColor(SSD1306_WHITE);                          // max brightness
+  screeny.display();                                            // update screen
+
+ // Startup synch: WILL GET BAD VALS IF THIS IS REMOVED. THIS TOOK HOURS TO FIND. DO NOT TOUCH
+  delay(1000);                      // give it a sec
+  while(Serial2.available() > 0){   // serial.available returns # of bytes in Rx buffer
+    Serial2.read();                 // reading a byte will remove it from buffer. 
+  }                                 // This empties the RX buffer on boot. 
+
+}
+
+void loop() {
+  if(createKey) KeyMaker();  // only runs once, creates the keys needed for random encryption.
+  ReceiveData();          // check RX buffer
+  ReadKey();              // read keypad
+
+  TxCipher    = Encrypt(UserBuff);    // encrypt user input in real time
+  TxPlainText = Decrypt(TxCipher);    // decrypt user input in real time (should match UserBuff)
+
+ SendData();              // only send data after Tx encryption^^^
+
+  // screeny shows incoming data. 
+  ScreenTime(screeny, 1,  0, String("Kpri : ") + Kpri       , 0,0, true , true, false);  // private key shown in yellow
+  ScreenTime(screeny, 1, 20, String("En.Rx: ") + RxCipher   , 0,0, false, true, false);  // display encrypted data received
+  ScreenTime(screeny, 1, 30, String("De.Rx: ") + RxPlainText, 0,0, false, true, true );  // display decrypted message received
+
+  // display shows outgoing data
+  ScreenTime(display, 1,  0, String("Kpub : ") + Kpub       , 0,0, true , true, false);  // public key in yellow
+  ScreenTime(display, 1, 20, String("Buff : ") + UserBuff   , 0,0, false, true, false);  // show user key buffer
+  ScreenTime(display, 1, 30, String("En.Tx: ") + TxCipher   , 0,0, false, true, false);  // show encrypted user buffer
+  ScreenTime(display, 1, 40, String("De.Tx: ") + TxPlainText, 0,0, false, true, true );  // show decrypted user buffer (should match key buffer)
+
+}
+
+String Encrypt(String input){                      // implements the RSA algorithm
+ uint32_t m         = BinaryBuilder(input);        // convert into 32-b#
+ uint32_t cipherOut = SquareAndMultiply(m,Kpub,N); // m^Kpub mod N
+ return StringBuilder(cipherOut);                  // convert 32-b# into string and return that.
+}
+
+String Decrypt(String input){                         // m = c^D mod N
+ uint32_t ciphertext = BinaryBuilder(input);          // convert string of chars to 32-bit binary value
+ uint32_t m = SquareAndMultiply(ciphertext, Kpri, N); // (ciphertext)^Kpri mod N
+ return StringBuilder(m);                             // convert from 32-b into string. 
+}
+
+String StringBuilder(uint32_t binaryIn){          // converts 32-b into a char string
+ String out;        // local string
+ out.reserve(8);    // reserve 8 bytes
+ out = "";          // clear it (bug)
+
+  uint8_t bit3124 = (binaryIn & 0xFF000000) >> 24;   // extract the 8 MSB (bits 31-24)
+  uint8_t bit2316 = (binaryIn & 0x00FF0000) >> 16;   // extract next 8 bits (bits 23-16)
+  uint8_t bit158  = (binaryIn & 0x0000FF00) >> 8;    // extract next 8 bits (bits 15-8)
+  uint8_t bit70  = (binaryIn & 0x000000FF);          // extract LSB (bits 0-7)
+
+ // 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0
+ //|___________|___________|___________|___________|___________|_________|_______|_______| 
+ //    C[0]        C[1]         C[2]        C[3]        C[4]       C[5]     C[6]    C[7]      
+
+  out += Hex2Char((bit3124 >> 4) & 0x0F);          // C[0]    // Hex2Char is a LUT which returns a char
+  out += Hex2Char( bit3124 & 0x0F);                // C[1]    // each line appends the output with next nibble
+  
+  out += Hex2Char((bit2316 >> 4) & 0x0F);          // C[2]    // >>  4 removes lower nibble
+  out += Hex2Char( bit2316 & 0x0F);                // C[3]    // &0x0F removes upper nibble
+
+  out += Hex2Char((bit158 >> 4) & 0x0F);           // C[4]
+  out += Hex2Char( bit158 & 0x0F);                 // C[5]
+  
+  out += Hex2Char((bit70 >> 4) & 0x0F);            // C[6]
+  out += Hex2Char( bit70 & 0x0F);                  // C[7]
+
+  return out;                                                 // return full 8-nibble output
+}
+
+uint32_t BinaryBuilder(const String& hexString){   // turns 8-char hex string into 32-bit binary
+
+  uint32_t a0 = ((uint32_t)(Char2Hex(hexString[0]) & 0x0F) << 4); // hexString contains [7-0] chars
+  uint32_t a1 =  (uint32_t)(Char2Hex(hexString[1]) & 0x0F);       // they must be separated to extract hex values
+  uint32_t A  = ((a0 | a1) & 0xFF) << 24;                         // then appended where they belong
+
+  uint32_t b0 = ((uint32_t)(Char2Hex(hexString[2]) & 0x0F) << 4); // they must all be 32-bit binary values
+  uint32_t b1 =  (uint32_t)(Char2Hex(hexString[3]) & 0x0F);       // nibble size is enforced using &0x0F
+  uint32_t B  = ((b0 | b1) & 0xFF) << 16;                         
+
+  uint32_t c0 = ((uint32_t)(Char2Hex(hexString[4]) & 0x0F) << 4); // hex 4 will be forced into a valid value and shifted 4 bits left
+  uint32_t c1 =  (uint32_t)(Char2Hex(hexString[5]) & 0x0F);       // then, hex5 is forced into a valid value and not shifted
+  uint32_t C  = ((c0 | c1) & 0xFF) << 8;                          // C then makes the nibbles (c1,c2) into a single byte and shifts them
+
+  uint32_t d0 = ((uint32_t)(Char2Hex(hexString[6]) & 0x0F) << 4); // this process is the same 4 times, 
+  uint32_t d1 =  (uint32_t)(Char2Hex(hexString[7]) & 0x0F);       // the only thing that changes is the hexString[] and
+  uint32_t D = (d0 | d1) & 0xFF;                                  // how much shift is needed (24,16,8,0)
+
+  return (A | B | C | D);   // output the 32-bit binary value. A,B,C,D are correctly shifted so that the OR operation just appends them
+}
+
+uint32_t SquareAndMultiply(uint32_t x, uint32_t powa, uint32_t modulus) {  // does x^powa mod modulus
+  uint64_t N        = modulus;        // modulus is passed in from encrypt or decrypt. it is the same in both
+  uint64_t base     = x % N;          // enforce the field that we can operate in
+  uint64_t exponent = powa;           // exponent value
+  uint64_t acc      = 1;              // accumulator for square and multiply algorithm
+
+  while (exponent) {                              // while exponent != 0
+    if (exponent & 0x01) acc = (acc * base) % N;  // if LSB of exponent is 1, accumulate the accumulator. enforce field
+    base = (base * base) % N;                     // always square, keep in field
+    exponent >>= 1;                               // degrade the exponent until it is 0, which will exit while loop
+  }
+  return (uint32_t)acc;                           // return accumulator. square and multiply complete
+}
+
+void ReceiveData() {            // processes data received over uart.
+ if (Serial2.available() < 5) {                                 // we expect 4 bytes and a \n. thats 5 bytes.
+ return;                                                        // if < 5, we likely checked in the middle of a send. 
+ }
+
+ uint8_t in_bytes[4];                                           // array for bytes we just verified ^^
+ size_t bytesRead = Serial2.readBytes((char*)in_bytes, 4);      // read the bytes 
+ int newlineByte = Serial2.read();                              // consume the \n
+
+ String incoming_hex_string;                                    // place to store the received bytes
+ incoming_hex_string.reserve(8);                                // gonna need space for 8 characters
+
+ for (int i = 0; i < 4; ++i) {                                  // iterate through the hex characters. we want standard chars
+ uint8_t current_byte = in_bytes[i];                            // load in the current byte
+ incoming_hex_string += Hex2Char(current_byte >> 4);            // byte must be split into nibbles, then converted to chars
+ incoming_hex_string += Hex2Char(current_byte & 0x0F);          // what he said ^^
+ }
+ RxCipher = incoming_hex_string;                                // received data is ENCRYPTED. store in global
+ RxPlainText = Decrypt(RxCipher);                               // decrypt message. store in global
+}
+
+void SendData(){    // sends data over UART
+  if (!SendIt) return;                                       // bool var controlled by user (enter key)
+  String hex8 = TxCipher;                                    // use ENCRYPTED value. 
+
+  while (hex8.length() < HexMax) { hex8 = "0" + hex8; }     // zero paddding enforces 8-nibble length
+  
+  uint8_t out_bytes[4];                                     // buffer for output
+   for (int i = 0; i < 4; ++i) {                            // iterate through nibbles (there are 8 nibbles = 4 bytes)
+    int char_index = 2 * i;                                 // bytes are formed from nibble pairs. this will walk through: {0,1}, {2.3}, {4,5}, {6,7}
+    uint8_t hi_nibble = Char2Hex(hex8[char_index]);         // the MSB nibble and LSB nibble are neighbors.
+    uint8_t lo_nibble = Char2Hex(hex8[char_index + 1]);     // said neighbor
+    out_bytes[i] = (uint8_t)((hi_nibble << 4) | lo_nibble); // shift high and OR with lo. all a part of this complete byte.
+  }                                                         // hi_nibble shifting makes tailing zeros, that lo_nibble fills
+
+  Serial2.write(out_bytes, 4);                              // we are in SendData after all.
+  Serial2.write('\n');                                      // signify end of transmission
+
+  SendIt = false;                                           // send done. dont go looping 
+  UserBuff = "";                                            // clear userbuff                     -----------------------------------------------------------------
+  return;                                                   // success
+}
+
+void ReadKey() {                                                    // function reads the keypad
+  for (int c = 0; c < NUM_COLS; ++c) {                              // iteratre through all columns
+    for (int k = 0; k < NUM_COLS; ++k) digitalWrite(COLS[k], HIGH); // set all columns high
+    digitalWrite(COLS[c], LOW);                                     // set one of them low at a time
+    delayMicroseconds(5);                                           // settle down
+
+    for (int r = 0; r < NUM_ROWS; ++r) {                            // iterate through rows
+      if (digitalRead(ROWS[r]) == LOW) {                            // hitting a button pulls a row down
+        delay(15);                                                  // debounce w/ 15ms delay
+        if (digitalRead(ROWS[r]) == LOW) {                          // if a low row is found,
+          while (digitalRead(ROWS[r]) == LOW) {}                    // wait for release to proceed
+
+          char Key = KEYS[r][c];                                    // returns key pressed
+           if(Key == '*'){ 
+            UserBuff = "";                                           // clear buffer if *
+           } else if(Key == '#'){ 
+            SendIt = true;                                           // send on #
+           } else if( UserBuff.length() < HexMax){UserBuff += Key;} // append key but enforce length max.
+        }
+      }
+    }
+  }
+  return;
+}
+
+void ScreenTime(Adafruit_SSD1306 &screen, int Font  , int Location     , const String& Label, float Value, int Decimal   , bool CLEAR , bool NoNum , bool Update) {
+ // Function    | Which Screen? (pointer)| Font Size | Vertical Location| Label on screen    | Variable   | Decimal Places| Clear data?| has number?| update screen?
+  if (CLEAR) screen.clearDisplay();                                   // clears screen data
+  screen.setTextColor(SSD1306_WHITE);                                 // sets screen to max brightness
+  screen.setTextSize(Font);                                           // sets font size
+  screen.setCursor(0, Location);                                      // sets vertical location of text 
+  screen.print(Label);                                                // prints the label
+  if (!NoNum) screen.println(Value, Decimal);                         // printout only, like "Wifi Ok"
+  if (Update) screen.display();                                       // update with fresh data
+}
+
+uint8_t Char2Hex(char nibble){                                             // lookup table to convert string to nibble (hex)
+  switch (nibble){
+    case '0': return 0x0;  case '1': return 0x1;  case '2': return 0x2;    // all possible values that can be passed
+    case '3': return 0x3;  case '4': return 0x4;  case '5': return 0x5;
+    case '6': return 0x6;  case '7': return 0x7;  case '8': return 0x8;
+    case '9': return 0x9;  case 'A': return 0xA;  case 'B': return 0xB;
+    case 'C': return 0xC;  case 'D': return 0xD;  case 'E': return 0xE;
+    case 'F': return 0xF;                                                  // F isnt on board, if we get an F in plaintext, there was an error
+    default: return 0x0;     // IMPORTANT: Encrypt() and Decrypt() both use this for real time cryptography. due to zero padding and constant use, 
+  }                          // the default must be 0 or whatever the default is will contaminate the calculation. 
+}
+
+char Hex2Char(uint8_t nib) {               // Lut
+  switch (nib & 0x0F) {
+    case 0x0: return '0'; case 0x1: return '1'; case 0x2: return '2'; case 0x3: return '3';
+    case 0x4: return '4'; case 0x5: return '5'; case 0x6: return '6'; case 0x7: return '7';
+    case 0x8: return '8'; case 0x9: return '9'; case 0xA: return 'A'; case 0xB: return 'B';
+    case 0xC: return 'C'; case 0xD: return 'D'; case 0xE: return 'E'; default: return 'F';    // consider changing to 0 instead
+  }
+}
+
+uint32_t KeyMaker(uint32_t N, uint32_t E, bool randomize) {
+ TrueRandom = analogRead(18);      // get floating analog value of unused pin
+ randomSeed(TrueRandom);           // use the float value to seed random numbers
+for(int i = 0; i < TrueRandom; i++){
+  random(0,4096)
+}
+
+  createKey = false;                                      // prevents this function from running more than once
+  if (N < 3 || (E%2 != 0)) return 0;                      // reject smal N values or odd E values
+  uint32_t p = 0;
+  uint32_t q = 0;
+  if ((N%2) == 0) { p = 2; q = N >> 1; }                  // if N is even, p=2, q=N/2
+  else {                                                  // if N is odd, 
+    for (uint32_t d = 3; d * d <= N; d += 2) {            // init d=3, square d until d^2 > N, each iteration d+2
+      if ((N % d) == 0) {                                 // if mod = 0, N is divisible by d
+         p = d;                                           // therefore, one factor of N is d, set p=d
+         q = N / d;                                       // find other factor by dividing
+         break; }                                         // problem solved, exit loop
+    }
+    if (p == 0) return 0;            // failed to factor
+  }
+  uint32_t phi = (p-1) * (q-1);
+
+  // extended Euclid: D0 = E^{-1} mod phi
+  int64_t prevCoeff = 0;            // previous coefficient
+  int64_t currCoeff = 1;            // current coefficient
+  int64_t prevRem = phi;            // previous remainder
+  int64_t currRem = E % phi;        // current remainder
+
+  while (currRem != 0) {                              // loop until remainder = 0
+    int64_t quotient = prevRem / currRem;             // finds current quotient
+    int64_t tmp = prevCoeff - quotient * currCoeff;   // long division
+    prevCoeff = currCoeff;                            // log previous coefficinet
+    currCoeff = tmp;                                  // update current coeff 
+    tmp = prevRem - quotient * currRem;               // extract current remainder
+    prevRem = currRem;                                // update previous remainder
+    currRem = tmp;                                    // update current remainder
+  }
+  if (prevRem != 1) return 0;                         // if gcd(E,phi) != 1, no mod inverse exists
+  uint32_t D = (prevCoeff < 0) ? (prevCoeff + phi) : prevCoeff;
+
+   if (randomize && phi) {                  // only if flag is true and φ > 0
+    uint32_t k = (esp_random() & 7);      // pick small random 0–7 (3 bits)
+    D = D + k * phi;                     // D' = D + k * phi
+  }
+
+  return D;                          // 0 ⇒ failure; else use (N,D) as private key
+}
