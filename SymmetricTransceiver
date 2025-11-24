@@ -49,8 +49,12 @@ const size_t HexMax = 8;  // enforces 8-nibble length. used in SendData and Read
  uint32_t N      = 0;
  uint32_t Kpri   = 0; 
  uint32_t phi    = 0;
- bool createKey = true;
+ bool createdKey = false;         // used to create one key at startup
+ bool gotN       = false;        // used to designate first few messages received as keys
+ bool sentN      = false;        // whether N was sent. changed in SendKeys()
+ bool boolfool   = false;        // SendData is a bool function, and sometimes a bool value is not needed.
 
+ uint32_t Peer_N = 0;
 
 void setup() {
   Serial.begin(115200);                                           // serial comm for computer use. Not needed for normal function
@@ -83,41 +87,276 @@ void setup() {
 
 }
 
+
+
 void loop() {
-  while(createKey){createKey = KeyMaker(); }
-  ReceiveData();          // check RX buffer
+  if(!(createdKey && sentN && gotN)) Exchange();
+
+
+  if(Serial2.available() >= 5){     // expected 4 bytes and a \n. thats 5 bytes.
+   RxCipher = ReceiveData();                  // extract the received cipher
+   RxPlainText = Decrypt(RxCipher, N, Kpri); // decode it using private key and public N
+  }
+
   ReadKey();              // read keypad
 
-  TxCipher    = Encrypt(UserBuff);    // encrypt user input in real time
-  TxPlainText = Decrypt(TxCipher);    // decrypt user input in real time (should match UserBuff)
+  TxCipher    = Encrypt(UserBuff, Peer_N, Kpub);    // encrypt user input in real time
+  TxPlainText = Decrypt(Encrypt(UserBuff, N, Kpub), N, Kpri);    // decrypt user input in real time (should match UserBuff)
 
- SendData();              // only send data after Tx encryption^^^
+ boolfool = SendData(TxCipher);              // only send data after Tx encryption^^^
+ UpdateScreens();
+}
 
+
+
+// --- Encyption and Decryption ---
+
+String Encrypt(String input, uint32_t n, uint32_t e){                      // implements the RSA algorithm
+ input = padHex8(input);                           // zero pad the input to 32-bit
+ uint32_t m         = BinaryBuilder(input);        // convert into 32-b#
+ if(n) m %= n;    // POSSIBLE BUG, MAKES DISPLAYED OUTPUT WRONG
+ uint32_t cipherOut = SquareAndMultiply(m,e,n); // m^Kpub mod N
+ return StringBuilder(cipherOut);                  // convert 32-b# into string and return that.
+}
+
+String Decrypt(String input, uint32_t n, uint32_t d){                         // m = c^D mod N
+ input = padHex8(input);
+ uint32_t ciphertext = BinaryBuilder(input);          // convert string of chars to 32-bit binary value
+ uint32_t m = SquareAndMultiply(ciphertext, d, n); // (ciphertext)^Kpri mod N
+ return StringBuilder(m);                             // convert from 32-b into string. 
+}
+
+
+//--- Key creation and exhanges -----
+void Exchange(){    // the full key creation and exchange processs.
+  ScreenTime(display, 1, 0, "Key Generating...", 0, 0, true, true, true);
+  while(!(createdKey && sentN && gotN)){   // checks that key transfer is finished
+  while(!createdKey){createdKey = KeyMaker(); }             // loop that will make keys till it finds 2 good working ones
+  while(!(sentN)){ SendKeys(N); }            // sends public keys N and E(Kpub). N is sent first, then E.
+  while(!(gotN)){                                   // waits until N and E are received
+  if(Serial2.available() >= 5){                             // if the Rx buffer has a message, 
+    if(!gotN){                                              //the first one will be N.
+     String stringyN = ReceiveData();                       // receive data returns a string. N is not that.
+     stringyN = padHex8(stringyN);                          // perform zero padding
+     Peer_N = BinaryBuilder(stringyN);                      // returns hex value to Peer_N  
+     gotN = true;                                           // N has been received
+      }        
+
+    }
+   }
+  }    
+}
+
+bool KeyMaker() {   // find and declare p,q,N,E,D,phi
+ int TrueRandom = analogRead(34);         // get floating analog value of unused pin
+ randomSeed(TrueRandom);                  // use the random value as a seed
+ int TruerRandom = analogRead(35);        // get another floating analog value of unused pin
+ TrueRandom = TrueRandom ^ TruerRandom;   // xor the two random values to stir the pot
+ randomSeed(TrueRandom);                  // use random value to seed random numbers
+
+  // LUT of highest value 16-bit prime numbers
+  static const uint32_t Primes[100] = {    // list of 100 primes that can possibly be either p or q
+  65521, 65519, 65513, 65497, 65479, 65437, 65423, 65419, 65413, 65393,
+  65371, 65357, 65353, 65347, 65327, 65323, 65287, 65279, 65267, 65263,
+  65257, 65239, 65233, 65231, 65213, 65203, 65183, 65179, 65173, 65171,
+  65167, 65159, 65147, 65143, 65141, 65123, 65119, 65099, 65089, 65063,
+  65053, 65041, 65033, 65029, 65027, 65011, 65003, 64997, 64969, 64937,
+  64927, 64921, 64919, 64901, 64891, 64877, 64871, 64849, 64841, 64831,
+  64811, 64801, 64783, 64781, 64763, 64747, 64717, 64711, 64709, 64703,
+  64693, 64679, 64661, 64657, 64651, 64627, 64621, 64613, 64609, 64591,
+  64579, 64567, 64553, 64547, 64543, 64513, 64507, 64501, 64499, 64493,
+  64489, 64483, 64463, 64451, 64439, 64433, 64403, 64399, 64381, 64373
+  };
+
+  // choose random numbers to to seed from, ensure they are not the same one.
+  uint8_t i = random() % 100;     // random number between 0-99
+  uint8_t j = random() % 100;     // random number from 0-99
+  while( j==i ) j = random() % 100; // make sure j != i
+
+  // set possible values of p and q to start
+  uint32_t maybe_p = Primes[i];   // set possible values from LUT 
+  uint32_t maybe_q = Primes[j];
+
+  // 
+  while (gcd32(Kpub, maybe_p - 1) != 1) {      // checks that p and q are coprimes
+    i = random(100);                        // reset i to be a different value if fails coprime
+    maybe_p = Primes[i];                    // get the ith prime value
+    }
+  while ( maybe_q == maybe_p || gcd32(Kpub, maybe_q - 1) != 1) {   // same as before, but also i and j cant be the same
+    j = random(100);                                             // randomize randomly
+    maybe_q = Primes[j];                                         // set new possible q value
+  }
+  p = maybe_p;                // set new values
+  q = maybe_q;                // another one
+  N = (uint32_t)((uint64_t)p * (uint64_t)q);                // overflow issue caused random miscalculation during startup
+  uint64_t phi64 = (uint64_t)(p - 1) * (uint64_t)(q - 1);  // 64-bit to avoid shinanigans
+phi = (uint32_t)phi64;                                   // enforce 32-bit phi val
+
+Kpri = modinv32(Kpub, (uint32_t)(phi64 % 0x100000000ULL));  // inverse using phi
+if (Kpri == 0) return false;
+
+  uint32_t m_test = 0x1234ABCD % N;                // Important: m < N (overflow, this took hours!)
+  uint32_t c_test = SquareAndMultiply(m_test, Kpub, N);
+  uint32_t m_back = SquareAndMultiply(c_test, Kpri, N);
+  if (m_back != m_test) return false;              // this should work, if not then repick p,q
+
+ return true;                 // create Key=false will prevent this function running again. permanently sets keys
+}
+
+
+void SendKeys(uint32_t n){
+  String N_send = StringBuilder(n);       // converts n into a string
+  SendIt = true;                          // SendData requires this variable be true  [[bug]]
+  sentN = SendData(N_send);               // send N, if SendDatais successful it will return true, clearing an initialization condition
+}                                         // Kpub and modulus are now sent. if there was a problem, the while loop will continue till there isnt one.
+
+// --- Transceiver Functions
+
+String ReceiveData() {            // processes data received over uart.
+ uint8_t in_bytes[4];                                           // array for bytes we just verified ^^
+ size_t bytesRead = Serial2.readBytes((char*)in_bytes, 4);      // read the bytes 
+ int newlineByte = Serial2.read();                              // consume the \n
+
+ String incoming_hex_string;                                    // place to store the received bytes
+ incoming_hex_string.reserve(8);                                // gonna need space for 8 characters
+
+ for (int i = 0; i < 4; ++i) {                                  // iterate through the hex characters. we want standard chars
+ uint8_t current_byte = in_bytes[i];                            // load in the current byte
+ incoming_hex_string += Hex2Char(current_byte >> 4);            // byte must be split into nibbles, then converted to chars
+ incoming_hex_string += Hex2Char(current_byte & 0x0F);          // what he said ^^
+ }
+ return incoming_hex_string;
+}
+
+bool SendData(String input){    // sends data over UART
+  if (!SendIt) return false;                                 // bool var controlled by user (enter key) 
+  String hex8 = padHex8(input);                              // zero pad the input
+  
+  uint8_t out_bytes[4];                                     // buffer for output
+   for (int i = 0; i < 4; ++i) {                            // iterate through nibbles (there are 8 nibbles = 4 bytes)
+    int char_index = 2 * i;                                 // bytes are formed from nibble pairs. this will walk through: {0,1}, {2.3}, {4,5}, {6,7}
+    uint8_t hi_nibble = Char2Hex(hex8[char_index]);         // the MSB nibble and LSB nibble are neighbors.
+    uint8_t lo_nibble = Char2Hex(hex8[char_index + 1]);     // said neighbor
+    out_bytes[i] = (uint8_t)((hi_nibble << 4) | lo_nibble); // shift high and OR with lo. all a part of this complete byte.
+  }                                                         // hi_nibble shifting makes tailing zeros, that lo_nibble fills
+
+  Serial2.write(out_bytes, 4);                              // we are in SendData after all.
+  Serial2.write('\n');                                      // signify end of transmission
+
+  SendIt = false;                                           // send done. dont go looping 
+  UserBuff = "";                                            // clear userbuff                     -----------------------------------------------------------------
+  return true;                                              // success
+}
+
+// User Interface Functions
+
+void UpdateScreens(){   // subfunction for screen outputs 
   // screeny shows incoming data. 
   ScreenTime(screeny, 1,  0, String("Kpri : ") + Kpri       , 0,0, true , true, false);  // private key shown in yellow
   ScreenTime(screeny, 1, 20, String("En.Rx: ") + RxCipher   , 0,0, false, true, false);  // display encrypted data received
   ScreenTime(screeny, 1, 30, String("De.Rx: ") + RxPlainText, 0,0, false, true, false);  // display decrypted message received
-  ScreenTime(screeny, 1, 40, String("N    : ") + N          , 0,0, false, true, false);  // show modulus
-  ScreenTime(screeny, 1, 50, String("Phi  : ") + phi        , 0,0, false, true, true );  // show phi
-
+  ScreenTime(screeny, 1, 40, String("N    : ") + N          , 0,0, false, true, true );  // show modulus
+  
   // display shows outgoing data
   ScreenTime(display, 1,  0, String("Kpub : ") + Kpub       , 0,0, true , true, false);  // public key in yellow
   ScreenTime(display, 1, 20, String("Buff : ") + UserBuff   , 0,0, false, true, false);  // show user key buffer
   ScreenTime(display, 1, 30, String("En.Tx: ") + TxCipher   , 0,0, false, true, false);  // show encrypted user buffer
   ScreenTime(display, 1, 40, String("De.Tx: ") + TxPlainText, 0,0, false, true, true );  // show decrypted user buffer (should match key buffer)
-
 }
 
-String Encrypt(String input){                      // implements the RSA algorithm
- uint32_t m         = BinaryBuilder(input);        // convert into 32-b#
- uint32_t cipherOut = SquareAndMultiply(m,Kpub,N); // m^Kpub mod N
- return StringBuilder(cipherOut);                  // convert 32-b# into string and return that.
+void ReadKey() {     // reads keypad for user input
+  for (int c = 0; c < NUM_COLS; ++c) {                              // iteratre through all columns
+    for (int k = 0; k < NUM_COLS; ++k) digitalWrite(COLS[k], HIGH); // set all columns high
+    digitalWrite(COLS[c], LOW);                                     // set one of them low at a time
+    delayMicroseconds(5);                                           // settle down
+
+    for (int r = 0; r < NUM_ROWS; ++r) {                            // iterate through rows
+      if (digitalRead(ROWS[r]) == LOW) {                            // hitting a button pulls a row down
+        delay(15);                                                  // debounce w/ 15ms delay
+        if (digitalRead(ROWS[r]) == LOW) {                          // if a low row is found,
+          while (digitalRead(ROWS[r]) == LOW) {}                    // wait for release to proceed
+
+          char Key = KEYS[r][c];                                    // returns key pressed
+           if(Key == '*'){ 
+            UserBuff = "";                                           // clear buffer if *
+           } else if(Key == '#'){ 
+            SendIt = true;                                           // send on #
+           } else if( UserBuff.length() < HexMax){UserBuff += Key;} // append key but enforce length max.
+        }
+      }
+    }
+  }
+  return;
 }
 
-String Decrypt(String input){                         // m = c^D mod N
- uint32_t ciphertext = BinaryBuilder(input);          // convert string of chars to 32-bit binary value
- uint32_t m = SquareAndMultiply(ciphertext, Kpri, N); // (ciphertext)^Kpri mod N
- return StringBuilder(m);                             // convert from 32-b into string. 
+// ---- Helpers ----
+
+void ScreenTime(Adafruit_SSD1306 &screen, int Font  , int Location     , const String& Label, float Value, int Decimal   , bool CLEAR , bool NoNum , bool Update) {
+ // Function    | Which Screen? (pointer)| Font Size | Vertical Location| Label on screen    | Variable   | Decimal Places| Clear data?| has number?| update screen?
+  if (CLEAR) screen.clearDisplay();                                   // clears screen data
+  screen.setTextColor(SSD1306_WHITE);                                 // sets screen to max brightness
+  screen.setTextSize(Font);                                           // sets font size
+  screen.setCursor(0, Location);                                      // sets vertical location of text 
+  screen.print(Label);                                                // prints the label
+  if (!NoNum) screen.println(Value, Decimal);                         // printout only, like "Wifi Ok"
+  if (Update) screen.display();                                       // update with fresh data
+}
+
+String padHex8(const String& s) {   // zero pads hex values for 32-bit
+  String out = s;
+  while (out.length() < 8) out = "0" + out;
+  if (out.length() > 8) out = out.substring(out.length() - 8); // keep low 32b if ever longer
+  return out;
+}
+
+uint32_t gcd32(uint32_t first, uint32_t second){    // finds the greatest common denominator using Euclid algorithm
+  uint32_t remainder = 0;                           // set remainder = 0 to start
+  while(second){                                    // degrades the second varibale
+    remainder = first%second;                       // find remainder of first / second
+    first = second;                                 // think of this as long division
+    second = remainder;                             // degradation of second
+  }
+  return first;                                     // first will hold the gcd at the end
+}
+
+uint32_t modinv32(uint32_t number, uint32_t modulus){       // extended euclidean algorithm
+ int64_t old_coeff = 0;                                     // older coeff for modulus term
+ int64_t new_coeff = 1;                                     // new coeff intialized to 1
+ int64_t old_rem = (int64_t)modulus;                        // start with old remainder = modulus
+ int64_t new_rem = (int64_t)(number % modulus);             // set new remainder to mod value, keeps in field, prevent overflow
+  while (new_rem != 0) {                                    // loop until remainder=0
+    int64_t quotient = old_rem / new_rem;                   // compute integer quotient
+    int64_t temp_coeff = old_coeff - quotient * new_coeff;  // Bezout update
+    old_coeff = new_coeff;                                  // reset coeff
+    new_coeff = temp_coeff;                                 // reset coeff
+    int64_t temp_rem = old_rem - quotient * new_rem;        // compute next remainder
+    old_rem = new_rem;                                      // shift remainders
+    new_rem = temp_rem;                                     // ^^
+  }
+  if (old_rem != 1) return 0;                               // if gcd 
+  if (old_coeff < 0) old_coeff += modulus;                  // if negative, use mod field to make positive (cyclic)
+  return (uint32_t)old_coeff;                               // return inverse 
+}
+
+uint8_t Char2Hex(char nibble){                              // lookup table to convert string to nibble (hex)
+  switch (nibble){
+    case '0': return 0x0;  case '1': return 0x1;  case '2': return 0x2;    // all possible values that can be passed
+    case '3': return 0x3;  case '4': return 0x4;  case '5': return 0x5;
+    case '6': return 0x6;  case '7': return 0x7;  case '8': return 0x8;
+    case '9': return 0x9;  case 'A': return 0xA;  case 'B': return 0xB;
+    case 'C': return 0xC;  case 'D': return 0xD;  case 'E': return 0xE;
+    case 'F': return 0xF;                                                  // F isnt on board, if we get an F in plaintext, there was an error
+    default: return 0x0;     // IMPORTANT: Encrypt() and Decrypt() both use this for real time cryptography. due to zero padding and constant use, 
+  }                          // the default must be 0 or whatever the default is will contaminate the calculation. 
+}
+
+char Hex2Char(uint8_t nib) {                                // LUT that turns hex values into characters
+  switch (nib & 0x0F) {
+    case 0x0: return '0'; case 0x1: return '1'; case 0x2: return '2'; case 0x3: return '3';
+    case 0x4: return '4'; case 0x5: return '5'; case 0x6: return '6'; case 0x7: return '7';
+    case 0x8: return '8'; case 0x9: return '9'; case 0xA: return 'A'; case 0xB: return 'B';
+    case 0xC: return 'C'; case 0xD: return 'D'; case 0xE: return 'E'; default: return 'F';    // consider changing to 0 instead
+  }
 }
 
 String StringBuilder(uint32_t binaryIn){          // converts 32-b into a char string
@@ -183,187 +422,3 @@ uint32_t SquareAndMultiply(uint32_t x, uint32_t powa, uint32_t modulus) {  // do
   }
   return (uint32_t)acc;                           // return accumulator. square and multiply complete
 }
-
-void ReceiveData() {            // processes data received over uart.
- if (Serial2.available() < 5) {                                 // we expect 4 bytes and a \n. thats 5 bytes.
- return;                                                        // if < 5, we likely checked in the middle of a send. 
- }
-
- uint8_t in_bytes[4];                                           // array for bytes we just verified ^^
- size_t bytesRead = Serial2.readBytes((char*)in_bytes, 4);      // read the bytes 
- int newlineByte = Serial2.read();                              // consume the \n
-
- String incoming_hex_string;                                    // place to store the received bytes
- incoming_hex_string.reserve(8);                                // gonna need space for 8 characters
-
- for (int i = 0; i < 4; ++i) {                                  // iterate through the hex characters. we want standard chars
- uint8_t current_byte = in_bytes[i];                            // load in the current byte
- incoming_hex_string += Hex2Char(current_byte >> 4);            // byte must be split into nibbles, then converted to chars
- incoming_hex_string += Hex2Char(current_byte & 0x0F);          // what he said ^^
- }
- RxCipher = incoming_hex_string;                                // received data is ENCRYPTED. store in global
- RxPlainText = Decrypt(RxCipher);                               // decrypt message. store in global
-}
-
-void SendData(){    // sends data over UART
-  if (!SendIt) return;                                       // bool var controlled by user (enter key)
-  String hex8 = TxCipher;                                    // use ENCRYPTED value. 
-
-  while (hex8.length() < HexMax) { hex8 = "0" + hex8; }     // zero paddding enforces 8-nibble length
-  
-  uint8_t out_bytes[4];                                     // buffer for output
-   for (int i = 0; i < 4; ++i) {                            // iterate through nibbles (there are 8 nibbles = 4 bytes)
-    int char_index = 2 * i;                                 // bytes are formed from nibble pairs. this will walk through: {0,1}, {2.3}, {4,5}, {6,7}
-    uint8_t hi_nibble = Char2Hex(hex8[char_index]);         // the MSB nibble and LSB nibble are neighbors.
-    uint8_t lo_nibble = Char2Hex(hex8[char_index + 1]);     // said neighbor
-    out_bytes[i] = (uint8_t)((hi_nibble << 4) | lo_nibble); // shift high and OR with lo. all a part of this complete byte.
-  }                                                         // hi_nibble shifting makes tailing zeros, that lo_nibble fills
-
-  Serial2.write(out_bytes, 4);                              // we are in SendData after all.
-  Serial2.write('\n');                                      // signify end of transmission
-
-  SendIt = false;                                           // send done. dont go looping 
-  UserBuff = "";                                            // clear userbuff                     -----------------------------------------------------------------
-  return;                                                   // success
-}
-
-void ReadKey() {                                                    // function reads the keypad
-  for (int c = 0; c < NUM_COLS; ++c) {                              // iteratre through all columns
-    for (int k = 0; k < NUM_COLS; ++k) digitalWrite(COLS[k], HIGH); // set all columns high
-    digitalWrite(COLS[c], LOW);                                     // set one of them low at a time
-    delayMicroseconds(5);                                           // settle down
-
-    for (int r = 0; r < NUM_ROWS; ++r) {                            // iterate through rows
-      if (digitalRead(ROWS[r]) == LOW) {                            // hitting a button pulls a row down
-        delay(15);                                                  // debounce w/ 15ms delay
-        if (digitalRead(ROWS[r]) == LOW) {                          // if a low row is found,
-          while (digitalRead(ROWS[r]) == LOW) {}                    // wait for release to proceed
-
-          char Key = KEYS[r][c];                                    // returns key pressed
-           if(Key == '*'){ 
-            UserBuff = "";                                           // clear buffer if *
-           } else if(Key == '#'){ 
-            SendIt = true;                                           // send on #
-           } else if( UserBuff.length() < HexMax){UserBuff += Key;} // append key but enforce length max.
-        }
-      }
-    }
-  }
-  return;
-}
-
-void ScreenTime(Adafruit_SSD1306 &screen, int Font  , int Location     , const String& Label, float Value, int Decimal   , bool CLEAR , bool NoNum , bool Update) {
- // Function    | Which Screen? (pointer)| Font Size | Vertical Location| Label on screen    | Variable   | Decimal Places| Clear data?| has number?| update screen?
-  if (CLEAR) screen.clearDisplay();                                   // clears screen data
-  screen.setTextColor(SSD1306_WHITE);                                 // sets screen to max brightness
-  screen.setTextSize(Font);                                           // sets font size
-  screen.setCursor(0, Location);                                      // sets vertical location of text 
-  screen.print(Label);                                                // prints the label
-  if (!NoNum) screen.println(Value, Decimal);                         // printout only, like "Wifi Ok"
-  if (Update) screen.display();                                       // update with fresh data
-}
-
-uint8_t Char2Hex(char nibble){                                             // lookup table to convert string to nibble (hex)
-  switch (nibble){
-    case '0': return 0x0;  case '1': return 0x1;  case '2': return 0x2;    // all possible values that can be passed
-    case '3': return 0x3;  case '4': return 0x4;  case '5': return 0x5;
-    case '6': return 0x6;  case '7': return 0x7;  case '8': return 0x8;
-    case '9': return 0x9;  case 'A': return 0xA;  case 'B': return 0xB;
-    case 'C': return 0xC;  case 'D': return 0xD;  case 'E': return 0xE;
-    case 'F': return 0xF;                                                  // F isnt on board, if we get an F in plaintext, there was an error
-    default: return 0x0;     // IMPORTANT: Encrypt() and Decrypt() both use this for real time cryptography. due to zero padding and constant use, 
-  }                          // the default must be 0 or whatever the default is will contaminate the calculation. 
-}
-
-char Hex2Char(uint8_t nib) {               // Lut
-  switch (nib & 0x0F) {
-    case 0x0: return '0'; case 0x1: return '1'; case 0x2: return '2'; case 0x3: return '3';
-    case 0x4: return '4'; case 0x5: return '5'; case 0x6: return '6'; case 0x7: return '7';
-    case 0x8: return '8'; case 0x9: return '9'; case 0xA: return 'A'; case 0xB: return 'B';
-    case 0xC: return 'C'; case 0xD: return 'D'; case 0xE: return 'E'; default: return 'F';    // consider changing to 0 instead
-  }
-}
-
-
-// everything below here is used in initial key making
-
-uint32_t gcd32(uint32_t first, uint32_t second){    // finds the greatest common denominator using Euclid algorithm
-  uint32_t remainder = 0;                           // set remainder = 0 to start
-  while(second){                                    // degrades the second varibale
-    remainder = first%second;                       // find remainder of first / second
-    first = second;                                 // think of this as long division
-    second = remainder;                             // degradation of second
-  }
-  return first;                                     // first will hold the gcd at the end
-}
-
-uint32_t modinv32(uint32_t number, uint32_t modulus){       // extended euclidean algorithm
- int64_t old_coeff = 0;                                     // older coeff for modulus term
- int64_t new_coeff = 1;                                     // new coeff intialized to 1
- int64_t old_rem = (int64_t)modulus;                        // start with old remainder = modulus
- int64_t new_rem = (int64_t)(number % modulus);             // set new remainder to mod value, keeps in field, prevent overflow
-  while (new_rem != 0) {                                    // loop until remainder=0
-    int64_t quotient = old_rem / new_rem;                   // compute integer quotient
-    int64_t temp_coeff = old_coeff - quotient * new_coeff;  // Bezout update
-    old_coeff = new_coeff;                                  // reset coeff
-    new_coeff = temp_coeff;                                 // reset coeff
-    int64_t temp_rem = old_rem - quotient * new_rem;        // compute next remainder
-    old_rem = new_rem;                                      // shift remainders
-    new_rem = temp_rem;                                     // ^^
-  }
-  if (old_rem != 1) return 0;                               // if gcd 
-  if (old_coeff < 0) old_coeff += modulus;                  // if negative, use mod field to make positive (cyclic)
-  return (uint32_t)old_coeff;                               // return inverse 
-}
-
-bool KeyMaker() {   // find and declare p,q,N,E,D,phi
-
-// Randomization sequence, prevents identical or predictable results
- int TrueRandom = analogRead(34);         // get floating analog value of unused pin
- randomSeed(TrueRandom);                  // use the random value as a seed
- int TruerRandom = analogRead(35);        // get another floating analog value of unused pin
- TrueRandom = TrueRandom ^ TruerRandom;   // xor the two random values to stir the pot
- randomSeed(TrueRandom);                  // use random value to seed random numbers
-
-  // LUT of highest value 16-bit prime numbers
-  static const uint32_t Primes[100] = {    // list of 100 primes that can possibly be either p or q
-  65521, 65519, 65513, 65497, 65479, 65437, 65423, 65419, 65413, 65393,
-  65371, 65357, 65353, 65347, 65327, 65323, 65287, 65279, 65267, 65263,
-  65257, 65239, 65233, 65231, 65213, 65203, 65183, 65179, 65173, 65171,
-  65167, 65159, 65147, 65143, 65141, 65123, 65119, 65099, 65089, 65063,
-  65053, 65041, 65033, 65029, 65027, 65011, 65003, 64997, 64969, 64937,
-  64927, 64921, 64919, 64901, 64891, 64877, 64871, 64849, 64841, 64831,
-  64811, 64801, 64783, 64781, 64763, 64747, 64717, 64711, 64709, 64703,
-  64693, 64679, 64661, 64657, 64651, 64627, 64621, 64613, 64609, 64591,
-  64579, 64567, 64553, 64547, 64543, 64513, 64507, 64501, 64499, 64493,
-  64489, 64483, 64463, 64451, 64439, 64433, 64403, 64399, 64381, 64373
-  };
-
-  // choose random numbers to to seed from, ensure they are not the same one.
-  uint8_t i = random() % 100;     // random number between 0-99
-  uint8_t j = random() % 100;     // random number from 0-99
-  while( j==i ) j = random() % 100; // make sure j != i
-
-  // set possible values of p and q to start
-  uint32_t maybe_p = Primes[i];   // set possible values from LUT 
-  uint32_t maybe_q = Primes[j];
-
-  // 
-  while (gcd32(Kpub, maybe_p - 1) != 1) {      // checks that p and q are coprimes
-    i = random(100);                        // reset i to be a different value if fails coprime
-    maybe_p = Primes[i];                    // get the ith prime value
-    }
-  while ( maybe_q == maybe_p || gcd32(Kpub, maybe_q - 1) != 1) {   // same as before, but also i and j cant be the same
-    j = random(100);                                             // randomize randomly
-    maybe_q = Primes[j];                                         // set new possible q value
-  }
-  p = maybe_p;                // set new values
-  q = maybe_q;                // another one
-  N = (uint32_t)((uint64_t)p * (uint64_t)q);
-  phi = (p-1) * (q-1);       // set phi
-  Kpri = modinv32(Kpub,phi);    // get D
-  if(Kpri == 0){return true;}  // if returns true, this function will run again
-return false;                 // createKey=false will prevent this function running again. permanently sets keys
-}
-
-
