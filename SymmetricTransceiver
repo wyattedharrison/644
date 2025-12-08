@@ -1,43 +1,33 @@
-#include <Wire.h>                                  // i2c comm library
-#include <Adafruit_GFX.h>                          // screen graphics library
-#include <Adafruit_SSD1306.h>                      // screen library
-#include <math.h>
+ #include <Wire.h>                                  // i2c comm library
+ #include <Adafruit_GFX.h>                          // screen graphics library
+ #include <Adafruit_SSD1306.h>                      // screen library
+ #include <math.h>
 
-// UART handling pins
-#define RX2_PIN          16                       // uses rx2 because rx1 has to be low during boot
-#define TX2_PIN          17                       // use Tx2 because it is related to rx2
-#define UART_BAUDRATE    115200                   // MUST match baud in other code
+ #define RX2_PIN          16                       // uses rx2 because rx1 has to be low during boot
+ #define TX2_PIN          17                       // use Tx2 because it is related to rx2
+ #define UART_BAUDRATE    115200                   // MUST match baud in other code
 
-// Instantiate Screens
-Adafruit_SSD1306 display(128, 64, &Wire, -1 );   // 128 wide, 64 high, I2C, no reset pin
-Adafruit_SSD1306 screeny(128, 64, &Wire, -1 );
-
-bool SendIt = false;            // true when enter key pressed
-
-constexpr int NUM_ROWS = 4;    // keypad is 4x4
-constexpr int NUM_COLS = 4;
-
-const int COLS[NUM_COLS] = { 26, 25, 33, 32 };   // column GPIOs (outputs)          https://cdn.sparkfun.com/assets/f/f/a/5/0/DS-16038.pdf
-const int ROWS[NUM_ROWS] = { 13, 14, 27, 23 };   // row GPIOs (inputs w/ pullups)
-
-const char KEYS[NUM_ROWS][NUM_COLS] = {  // Key layout (row, col)
+ Adafruit_SSD1306 display(128, 64, &Wire, -1 );   // 128 wide, 64 high, I2C, no reset pin
+ Adafruit_SSD1306 screeny(128, 64, &Wire, -1 );
+ //https://cdn.sparkfun.com/assets/f/f/a/5/0/DS-16038.pdf
+ constexpr int NUM_ROWS = 4;    // keypad is 4x4
+ constexpr int NUM_COLS = 4;
+ const int COLS[NUM_COLS] = { 26, 25, 33, 32 };   // column GPIOs (outputs)          
+ const int ROWS[NUM_ROWS] = { 13, 14, 27, 23 };   // row GPIOs (inputs w/ pullups)
+ const char KEYS[NUM_ROWS][NUM_COLS] = {  // Key layout (row, col)
   {'1','2','3','A'},
   {'4','5','6','B'},
   {'7','8','9','C'},
   {'*','0','#','D'}
-};
-String UserBuff;      // ReadKey() writes to this. 
-String TxCipher;      // encrypted version of user input. for display only
-String TxPlainText;   // decrypted version of user input. should match UserBuff at all times
-String RxCipher;      // encrypted version of received data. This is how all data should be received
-String RxPlainText;   // decrypted version of received data. should match user input on other device
+ };
 
-const size_t HexMax = 8;  // enforces 8-nibble length. used in SendData and ReadKey
+ String UserBuff;      // ReadKey() writes to this. 
+ String TxCipher;      // encrypted version of user input. for display only
+ String TxPlainText;   // decrypted version of user input. should match UserBuff at all times
+ String RxCipher;      // encrypted version of received data. This is how all data should be received
+ String RxPlainText;   // decrypted version of received data. should match user input on other device
 
-// RSA variables
-// public variables are predefined, private will be calculated from scratch
-
-// UNCOMMENT ALL 3 FOR ORIGINAL FUNCTIONALITY 
+ const size_t HexMax = 8;  // enforces 8-nibble length. used in SendData and ReadKey
  uint32_t Kpub  = 0x00010001;    // public key, E --> (N,E)                  PUBLIC,  same in both
  //uint32_t Kpri  = 0x57EDF941;  // E*D = 1 mod phi(N). aka 'D' ---> (N,D) PRIVATE, unique to each device
  //uint32_t N     = 0xFFE000FF;  // modulus value, N = 0xFFE000FF.       PUBLIC,  unique to each device
@@ -50,14 +40,14 @@ const size_t HexMax = 8;  // enforces 8-nibble length. used in SendData and Read
  bool gotN       = false;        // used to designate first few messages received as keys
  bool sentN      = false;        // whether N was sent. changed in SendKeys()
  bool boolfool   = false;        // SendData is a bool function, and sometimes a bool value is not needed.
-
+ bool SendIt = false;            // true when enter key pressed
  uint32_t Peer_N = 0;            // calculated during key exchange
 
 void setup() {
-  Serial.begin(115200);                                          // serial comm for computer use. Not needed for normal function
+  Serial.begin(115200);                                          // serial comm for computer use
   while (!Serial) {delay(10);}                                   // wait for serial to be established
-  Serial2.begin(UART_BAUDRATE, SERIAL_8N1, RX2_PIN, TX2_PIN);    // predefined baud, 8bit1stop no parity, predefined rx&tx pins
-  Serial2.setTimeout(500);                                       // exit if serial comm takes more than 500ms
+  Serial2.begin(UART_BAUDRATE, SERIAL_8N1, RX2_PIN, TX2_PIN);    // baud, 8bit1stop no parity, rx&tx pins
+  Serial2.setTimeout(500);                                       // exit if serial comm takes > 500ms
   Wire.begin(21, 22);                                            // define 21 and 22 as I2C pins
   display.begin( SSD1306_SWITCHCAPVCC, 0x3C );                   // OLED initialization
   screeny.begin( SSD1306_SWITCHCAPVCC, 0x3D );                   // Different address for screeny
@@ -66,22 +56,18 @@ void setup() {
   pinMode(COLS[c], OUTPUT);                                      // set all columns to output
   digitalWrite(COLS[c], HIGH);                                   // idle columns HIGH
   }
-  for (int r = 0; r < 4; ++r) { pinMode(ROWS[r], INPUT_PULLUP);} // set row pins as inputs. They need pullups
+  for (int r = 0; r < 4; ++r) { pinMode(ROWS[r], INPUT_PULLUP);} // set row pins as default high inputs
 
-  display.clearDisplay();                                       // remove previous screen data
-  display.setTextColor(SSD1306_WHITE);                          // max brightness
-  display.display();                                            // update display
+  display.clearDisplay(); screeny.clearDisplay();                // remove previous screen data
+  display.setTextColor(SSD1306_WHITE);                           // max brightness
+  screeny.setTextColor(SSD1306_WHITE);                           // max brightness
+  display.display(); screeny.display();                          // update display
 
-  screeny.clearDisplay();                                       // remove previous sceen data
-  screeny.setTextColor(SSD1306_WHITE);                          // max brightness
-  screeny.display();                                            // update screen
-
- // Startup synch: WILL GET BAD VALS IF THIS IS REMOVED. THIS TOOK HOURS TO FIND. DO NOT TOUCH. BUG
+ // BUG! WILL GET BAD VALS IF THIS IS REMOVED. THIS TOOK HOURS TO FIND. DO NOT TOUCH. 
   delay(1000);                      // give it a sec
   while(Serial2.available() > 0){   // serial.available returns # of bytes in Rx buffer
     Serial2.read();                 // reading a byte will remove it from buffer. 
   }                                 // This empties the RX buffer on boot. 
-
 }
 
 
@@ -125,15 +111,15 @@ String Decrypt(String input, uint32_t n, uint32_t d){ // m = c^D mod N
 
 
 //=== Key creation and Exhange ===
-void Exchange(){                                  // the full key creation and exchange processs.
+void Exchange(){                                  // full key creation and exchange processs
   ScreenTime(display, 1, 0, "Key Generating...", 0, 0, true, true, true); 
   while(!(createdKey && sentN && gotN)){          // checks that key transfer is finished
-  while(!createdKey){createdKey = KeyMaker(); }   // loop that will make keys until it finds 2 working ones. makes createdKey = true
+  while(!createdKey){createdKey = KeyMaker(); }   // make keys until we find 2 working ones
   while(!(sentN)){ SendKeys(N); }                 // sends public key N
   while(!(gotN)){                                 // waits until N is received
   if(Serial2.available() >= 5){                   // if the Rx buffer has a message, 
     if(!gotN){                                    // if N is not yet present,
-     String stringyN = ReceiveData();             // receive data returns a string. N is not that.
+     String stringyN = ReceiveData();             // ReceiveData returns a string. N is not that.
      stringyN = padHex8(stringyN);                // perform zero padding
      Peer_N = BinaryBuilder(stringyN);            // returns binary value to Peer_N  
      gotN = true;                                 // N has been received.
@@ -145,7 +131,6 @@ void Exchange(){                                  // the full key creation and e
 }
 
 bool KeyMaker() {                         // find and declare p,q,N,E,D,phi
-// Randomization Sequence. truely random #s
  int TrueRandom = analogRead(34);         // get floating analog value of unused pin
  randomSeed(TrueRandom);                  // use the random value as a seed
  int TruerRandom = analogRead(35);        // get another floating analog value of unused pin
@@ -162,10 +147,8 @@ bool KeyMaker() {                         // find and declare p,q,N,E,D,phi
   64811, 64801, 64783, 64781, 64763, 64747, 64717, 64711, 64709, 64703,
   64693, 64679, 64661, 64657, 64651, 64627, 64621, 64613, 64609, 64591,
   64579, 64567, 64553, 64547, 64543, 64513, 64507, 64501, 64499, 64493,
-  64489, 64483, 64463, 64451, 64439, 64433, 64403, 64399, 64381, 64373
-  };
-
-  // choose random numbers to to seed from, they cant be the same one.
+  64489, 64483, 64463, 64451, 64439, 64433, 64403, 64399, 64381, 64373 };
+ 
   uint8_t i = random() % 100;       // random number between 0-99
   uint8_t j = random() % 100;       // random number from 0-99
   while( j==i ) j = random() % 100; // make sure j != i
@@ -180,20 +163,18 @@ bool KeyMaker() {                         // find and declare p,q,N,E,D,phi
     j = random(100);                                             // randomize randomly
     maybe_q = Primes[j];                                         // set new possible q value upon failure
   }
-  p = maybe_p;                                               // set new values
-  q = maybe_q;                                               // another one
-  N = (uint32_t)((uint64_t)p * (uint64_t)q);                 // overflow issue caused random miscalculation during startup. 
+  p = maybe_p;  q = maybe_q;                                     // set new values
+  N = (uint32_t)((uint64_t)p * (uint64_t)q);                 // BUG overflow issue caused random miscalculation during startup. 
   uint64_t phi64 = (uint64_t)(p - 1) * (uint64_t)(q - 1);    // 64-bit to avoid shinanigans
   phi = (uint32_t)phi64;                                     // enforce 32-bit phi val
 
-  Kpri = modinv32(Kpub, (uint32_t)(phi64 % 0x100000000ULL)); // inverse using phi. # enforces 32b, ULL declares as unsigned long long
+  Kpri = modinv32(Kpub, (uint32_t)(phi64 % 0x100000000ULL)); // inverse phi. # enforces 32b, ULL declares unsigned long long
   if (Kpri == 0) return false;
 
   uint32_t m_test = 0x1234ABCD % N;                // Important: m < N (overflow, this took hours!)
   uint32_t c_test = SquareAndMultiply(m_test, Kpub, N);
   uint32_t m_back = SquareAndMultiply(c_test, Kpri, N);
   if (m_back != m_test) return false;              // this should work, if not then repick p,q
-
  return true;                 // create Key=true will prevent this function running again. permanently sets keys
 }
 
@@ -310,40 +291,35 @@ String StringBuilder(uint32_t binaryIn){          // converts 32-b into a char s
  //|___________|___________|___________|___________|___________|_________|_______|_______| 
  //    C[0]        C[1]         C[2]        C[3]        C[4]       C[5]     C[6]    C[7]      
 
-  out += Hex2Char((bit3124 >> 4) & 0x0F);          // C[0]    // Hex2Char is a LUT which returns a char
-  out += Hex2Char( bit3124 & 0x0F);                // C[1]    // each line appends the output with next nibble
-  
-  out += Hex2Char((bit2316 >> 4) & 0x0F);          // C[2]    // >>  4 removes lower nibble
-  out += Hex2Char( bit2316 & 0x0F);                // C[3]    // &0x0F removes upper nibble
-
-  out += Hex2Char((bit158 >> 4) & 0x0F);           // C[4]
-  out += Hex2Char( bit158 & 0x0F);                 // C[5]
-  
-  out += Hex2Char((bit70 >> 4) & 0x0F);            // C[6]
-  out += Hex2Char( bit70 & 0x0F);                  // C[7]
+  out += Hex2Char((bit3124 >> 4) & 0x0F); // C[0]  Hex2Char is a LUT, returns a char
+  out += Hex2Char( bit3124 & 0x0F);       // C[1]  each line appends output with next nibble
+  out += Hex2Char((bit2316 >> 4) & 0x0F); // C[2]  >>  4 removes lower nibble
+  out += Hex2Char( bit2316 & 0x0F);       // C[3]  &0x0F removes upper nibble
+  out += Hex2Char((bit158 >> 4) & 0x0F);  // C[4]
+  out += Hex2Char( bit158 & 0x0F);        // C[5]
+  out += Hex2Char((bit70 >> 4) & 0x0F);   // C[6]
+  out += Hex2Char( bit70 & 0x0F);         // C[7]
 
   return out;                                                 // return full 8-nibble output
 }
 
 uint32_t BinaryBuilder(const String& hexString){   // turns 8-char hex string into 32-bit binary
-
   uint32_t a0 = ((uint32_t)(Char2Hex(hexString[0]) & 0x0F) << 4); // hexString contains [7-0] chars
-  uint32_t a1 =  (uint32_t)(Char2Hex(hexString[1]) & 0x0F);       // they must be separated to extract hex values
+  uint32_t a1 =  (uint32_t)(Char2Hex(hexString[1]) & 0x0F);       // must be separated to extract hex values
   uint32_t A  = ((a0 | a1) & 0xFF) << 24;                         // then appended where they belong
 
   uint32_t b0 = ((uint32_t)(Char2Hex(hexString[2]) & 0x0F) << 4); // they must all be 32-bit binary values
   uint32_t b1 =  (uint32_t)(Char2Hex(hexString[3]) & 0x0F);       // nibble size is enforced using &0x0F
   uint32_t B  = ((b0 | b1) & 0xFF) << 16;                         
 
-  uint32_t c0 = ((uint32_t)(Char2Hex(hexString[4]) & 0x0F) << 4); // hex 4 will be forced into a valid value and shifted 4 bits left
-  uint32_t c1 =  (uint32_t)(Char2Hex(hexString[5]) & 0x0F);       // then, hex5 is forced into a valid value and not shifted
-  uint32_t C  = ((c0 | c1) & 0xFF) << 8;                          // C then makes the nibbles (c1,c2) into a single byte and shifts them
+  uint32_t c0 = ((uint32_t)(Char2Hex(hexString[4]) & 0x0F) << 4); // hex 4 shifted 4 bits left
+  uint32_t c1 =  (uint32_t)(Char2Hex(hexString[5]) & 0x0F);       // then, hex5 is not shifted
+  uint32_t C  = ((c0 | c1) & 0xFF) << 8;                          // C is a byte shifted the correct amount
 
   uint32_t d0 = ((uint32_t)(Char2Hex(hexString[6]) & 0x0F) << 4); // this process is the same 4 times, 
-  uint32_t d1 =  (uint32_t)(Char2Hex(hexString[7]) & 0x0F);       // the only thing that changes is the hexString[] and
-  uint32_t D = (d0 | d1) & 0xFF;                                  // how much shift is needed (24,16,8,0)
-
-  return (A | B | C | D);   // output the 32-bit binary value. A,B,C,D are correctly shifted so that the OR operation just appends them
+  uint32_t d1 =  (uint32_t)(Char2Hex(hexString[7]) & 0x0F);       // the only thing that changes is the hexString[]
+  uint32_t D = (d0 | d1) & 0xFF;                                  // and how much shift is needed (24,16,8,0)
+  return (A | B | C | D);   // output the 32-b value. A,B,C,D are correctly shifted. OR operation just appends them
 }
 
 uint8_t Char2Hex(char nibble){                              // lookup table to convert string to nibble (hex)
